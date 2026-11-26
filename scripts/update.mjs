@@ -100,75 +100,54 @@ function categorise(text) {
     ['music', /singer|musician|rapper|songwriter|composer|record producer|disc jockey|guitarist|drummer|pianist/],
     ['screen', /actor|actress|film|television|director|comedian|presenter|youtuber|model|influencer|screenwriter|broadcaster|streamer/],
   ];
-  for (const [cat, re] of rules) if (re.test(t)) return cat;
-  return 'culture';
+  // The occupation named first in the description wins ("actress and singer" is screen, not music).
+  let best = ['culture', Infinity];
+  for (const [cat, re] of rules) { const m = t.match(re); if (m && m.index < best[1]) best = [cat, m.index]; }
+  return best[0];
 }
-async function peopleViaSparql(titles) {
-  const out = new Map();
-  for (let i = 0; i < titles.length; i += 100) {
-    const values = titles.slice(i, i + 100).map((t) => `"${t.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"@en`).join(' ');
-    const query = `SELECT ?title ?desc (GROUP_CONCAT(DISTINCT ?occL; separator=", ") AS ?occ) WHERE {
-      VALUES ?title { ${values} }
-      ?sl schema:name ?title; schema:isPartOf <https://en.wikipedia.org/>; schema:about ?item.
-      ?item wdt:P31 wd:Q5.
-      OPTIONAL { ?item schema:description ?desc. FILTER(LANG(?desc) = "en") }
-      OPTIONAL { ?item wdt:P106 ?o. ?o rdfs:label ?occL. FILTER(LANG(?occL) = "en") }
-    } GROUP BY ?title ?desc`;
-    const data = await get('https://query.wikidata.org/sparql', {
-      json: true, method: 'POST', timeout: 60000,
-      body: new URLSearchParams({ query }).toString(),
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/sparql-results+json' },
-    });
-    for (const b of data.results.bindings) out.set(b.title.value, { desc: b.desc?.value || '', occ: b.occ?.value || '' });
-  }
-  return out;
-}
-async function peopleViaApi(titles) {
-  // Fallback when the query service is unavailable: Wikipedia for item IDs, Wikidata for "instance of human".
-  const out = new Map();
+const known = new Map(); // title -> { desc } for humans, null for everything else
+async function resolvePeople(allTitles) {
+  // Wikipedia gives each article's Wikidata item and short description; Wikidata says whether the item is a human.
+  const titles = allTitles.filter((t) => !known.has(t));
   for (let i = 0; i < titles.length; i += 50) {
     const chunk = titles.slice(i, i + 50);
+    chunk.forEach((t) => known.set(t, null));
     const q = await get('https://en.wikipedia.org/w/api.php?' + new URLSearchParams({ action: 'query', format: 'json', prop: 'pageprops|description', ppprop: 'wikibase_item', redirects: '1', titles: chunk.join('|') }), { json: true });
     const pages = Object.values(q.query?.pages || {}).filter((p) => p.pageprops?.wikibase_item);
     if (!pages.length) continue;
     const ents = await get('https://www.wikidata.org/w/api.php?' + new URLSearchParams({ action: 'wbgetentities', format: 'json', props: 'claims', ids: pages.map((p) => p.pageprops.wikibase_item).join('|') }), { json: true, timeout: 60000 });
     for (const p of pages) {
       const claims = ents.entities?.[p.pageprops.wikibase_item]?.claims?.P31 || [];
-      if (claims.some((c) => c.mainsnak?.datavalue?.value?.id === 'Q5')) out.set(p.title, { desc: p.description || '', occ: '' });
+      if (claims.some((c) => c.mainsnak?.datavalue?.value?.id === 'Q5')) known.set(p.title, { desc: p.description || '' });
     }
   }
-  return out;
+}
+async function rankedPeople(articles, limit) {
+  const candidates = articles.slice(0, 420);
+  await resolvePeople(candidates.map((a) => a.article.replace(/_/g, ' ')));
+  return candidates.filter((a) => known.get(a.article.replace(/_/g, ' '))).slice(0, limit);
 }
 async function guestList() {
   let today;
   let offset = 1;
   for (; offset <= 3; offset++) { try { today = await topArticles(offset); break; } catch { /* that day is not published yet */ } }
   if (!today) throw new Error('no pageview data available');
-  let prevRank = new Map();
-  try {
-    const prev = await topArticles(offset + 1);
-    prev.articles.forEach((a) => prevRank.set(a.article, a.rank));
-  } catch { /* rank change is optional */ }
-  const candidates = today.articles.slice(0, 420);
-  const titles = candidates.map((a) => a.article.replace(/_/g, ' '));
-  let info;
-  try { info = await peopleViaSparql(titles); log.push({ kind: 'people', via: 'sparql', ok: true, count: info.size }); }
-  catch (e) { log.push({ kind: 'people', via: 'sparql', ok: false, error: String(e.message || e) }); info = await peopleViaApi(titles); log.push({ kind: 'people', via: 'api', ok: true, count: info.size }); }
-  const people = [];
-  const prevPeopleOrder = [...prevRank.entries()].sort((a, b) => a[1] - b[1]).map(([t]) => t.replace(/_/g, ' ')).filter((t) => info.has(t));
-  for (const a of candidates) {
+  const todays = await rankedPeople(today.articles, 100);
+  log.push({ kind: 'people', ok: true, count: todays.length });
+  // Yesterday's list is ranked the same way, so positions are comparable.
+  const before = new Map();
+  try { (await rankedPeople((await topArticles(offset + 1)).articles, 250)).forEach((a, i) => before.set(a.article, i + 1)); }
+  catch (e) { log.push({ kind: 'people-previous', ok: false, error: String(e.message || e) }); }
+  const people = todays.map((a, i) => {
     const name = a.article.replace(/_/g, ' ');
-    const meta = info.get(name);
-    if (!meta) continue;
-    const before = prevPeopleOrder.indexOf(name);
-    people.push({
-      r: people.length + 1, n: name.replace(/ \([^)]*\)$/, ''), title: a.article, views: a.views,
-      desc: meta.desc ? meta.desc.charAt(0).toUpperCase() + meta.desc.slice(1) : '',
-      cat: categorise(`${meta.desc} ${meta.occ}`),
-      chg: before === -1 ? null : before + 1 - (people.length + 1),
-    });
-    if (people.length === 100) break;
-  }
+    const desc = known.get(name).desc;
+    return {
+      r: i + 1, n: name.replace(/ \([^)]*\)$/, ''), title: a.article, views: a.views,
+      desc: desc ? desc.charAt(0).toUpperCase() + desc.slice(1) : '',
+      cat: categorise(desc),
+      chg: before.size && before.has(a.article) ? before.get(a.article) - (i + 1) : null,
+    };
+  });
   if (people.length < 20) throw new Error('too few people resolved: ' + people.length);
   return { date: today.date, updated: now.toISOString(), people };
 }

@@ -69,7 +69,7 @@ export const FEEDS = [
   ['society', 'The Guardian', 'https://www.theguardian.com/uk/monarchy/rss'],
   ['society', 'The Guardian', 'https://www.theguardian.com/fashion/rss'],
   ['society', 'Vanity Fair', 'https://www.vanityfair.com/feed/rss'],
-  ['society', 'HELLO!', 'https://www.hellomagazine.com/rss/royalty/'],
+  ['society', 'The Guardian', 'https://www.theguardian.com/lifeandstyle/rss'],
 ];
 
 // Official publisher channels. The channel name shown on the site comes from YouTube's own feed.
